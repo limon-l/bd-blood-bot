@@ -110,6 +110,30 @@ export default {
       });
     });
 
+    // NEW FEATURE: Profile Command
+    bot.command("profile", async (ctx) => {
+      const chatId = ctx.chat?.id;
+      if (!chatId) return;
+
+      const { data: donor } = await supabase.from("telegram_donors").select("*").eq("chat_id", chatId).maybeSingle();
+      if (!donor) return ctx.reply("⚠️ You are not registered yet. Type /start to register.");
+
+      const lastDonated = donor.last_donation_date ? donor.last_donation_date : "Never / Not Updated";
+      await ctx.reply(`👤 <b>Your Donor Profile</b>\n\n📛 <b>Name:</b> ${escapeHtml(donor.full_name)}\n🩸 <b>Blood Group:</b> ${escapeHtml(donor.blood_group)}\n📞 <b>Phone:</b> ${escapeHtml(donor.phone_number)}\n📍 <b>Location:</b> ${escapeHtml(donor.upazila)}, ${escapeHtml(donor.district)}\n📅 <b>Last Donated:</b> ${escapeHtml(lastDonated)}\n\n<i>To update your donation date, type /donated</i>`, { parse_mode: "HTML" });
+    });
+
+    // NEW FEATURE: Update Donation Date Command
+    bot.command("donated", async (ctx) => {
+      const chatId = ctx.chat?.id;
+      if (!chatId) return;
+
+      const { data: existingUser } = await supabase.from("telegram_donors").select("chat_id").eq("chat_id", chatId).maybeSingle();
+      if (!existingUser) return ctx.reply("⚠️ You must be a registered donor first. Type /start");
+
+      await updateSession(chatId, "UPDATE_LAST_DONATION", {});
+      await ctx.reply("📅 <b>Update Last Donation Date</b>\n\nPlease reply with the date you last donated blood in this format: <b>DD-MM-YYYY</b> (e.g. 15-08-2023)\n\n<i>Or type /cancel to abort.</i>", { parse_mode: "HTML" });
+    });
+
     bot.command("cancel", async (ctx) => {
       const chatId = ctx.chat?.id;
       if (!chatId) return;
@@ -215,7 +239,7 @@ export default {
         }
 
         // ==========================================
-        // NEW FEATURE: MULTI-BAG TRACKING LOGIC
+        // MULTI-BAG TRACKING LOGIC
         // ==========================================
         else if (action === "managed") {
           if (session.current_step !== "WAITING_DONOR") {
@@ -223,24 +247,17 @@ export default {
           }
 
           const finalMeta = session.metadata || {};
-          
-          // Parse the requested bags (fallback to 1). "5+" parses safely as 5.
           const totalBags = parseInt(finalMeta.bags) || 1;
-          
-          // Increment the managed bag counter
           finalMeta.bags_managed = (finalMeta.bags_managed || 0) + 1;
 
-          // Remove the button from THIS specific donor message so it can't be clicked twice
           await ctx.editMessageReplyMarkup();
 
-          // Check if we still need more bags
           if (finalMeta.bags_managed < totalBags) {
               const remaining = totalBags - finalMeta.bags_managed;
               await updateSession(chatId, "WAITING_DONOR", finalMeta);
               return ctx.reply(`✅ <b>1 bag successfully managed!</b>\n\nYou still need <b>${remaining}</b> more bag(s). The search is still active, waiting for more donors...`, { parse_mode: "HTML" });
           }
 
-          // If ALL bags are managed, proceed to close the request and broadcast
           await ctx.reply("✅ <b>All requested bags managed! Request closed.</b> Notifying donors that the emergency is fulfilled...", { parse_mode: "HTML" });
 
           const { data: donors } = await supabase
@@ -308,6 +325,23 @@ export default {
           await ctx.reply("✅ Phone saved.", { reply_markup: { remove_keyboard: true } });
           await showDivisions(ctx, "Step 3/4");
         }
+        
+        // NEW FEATURE: Date Parsing and Saving
+        else if (session.current_step === "UPDATE_LAST_DONATION") {
+          const dateRegex = /^(0[1-9]|[12][0-9]|3[01])-(0[1-9]|1[012])-\d{4}$/;
+          if (!dateRegex.test(text)) {
+            return ctx.reply("⚠️ <b>Invalid format.</b> Please use EXACTLY <b>DD-MM-YYYY</b> (e.g. 15-08-2023):", { parse_mode: "HTML" });
+          }
+          
+          // Convert DD-MM-YYYY to YYYY-MM-DD for standard database storage
+          const parts = text.split("-");
+          const dbFormattedDate = `${parts[2]}-${parts[1]}-${parts[0]}`;
+
+          await supabase.from("telegram_donors").update({ last_donation_date: dbFormattedDate }).eq("chat_id", chatId);
+          await updateSession(chatId, "IDLE", {});
+          await ctx.reply(`✅ <b>Date Updated!</b> Your last donation date has been successfully recorded.`, { parse_mode: "HTML" });
+        }
+
         else if (session.current_step === "REQ_HOSPITAL") {
           await updateSession(chatId, "REQ_PHONE", { ...meta, hospital: text });
           await ctx.reply("📞 Enter an emergency contact number:");
@@ -318,17 +352,19 @@ export default {
           await ctx.reply("🩺 Briefly describe the patient's condition (e.g. Surgery, Dengue):");
         } 
         else if (session.current_step === "REQ_PROBLEM") {
-          // Initialize bags_managed to 0 when the request starts
           const finalMeta = { ...meta, problem: text, bags_managed: 0 };
           
           await ctx.reply("⏳ Searching database and organizing alert system...");
 
+          // NEW FEATURE: Automatic Prioritization Logic
+          // .order() puts users who have NEVER donated (nullsFirst) or haven't donated in a long time (ascending) at the very front of the broadcast queue.
           const { data: donors } = await supabase
             .from("telegram_donors")
-            .select("chat_id")
+            .select("chat_id, last_donation_date")
             .eq("blood_group", finalMeta.bloodGroup)
             .ilike("district", `%${finalMeta.district.trim()}%`)
-            .ilike("upazila", `%${finalMeta.upazila.trim()}%`);
+            .ilike("upazila", `%${finalMeta.upazila.trim()}%`)
+            .order('last_donation_date', { ascending: true, nullsFirst: true });
 
           if (donors && donors.length > 0) {
               const alertMsg = `🚨 <b>URGENT BLOOD REQUEST</b> 🚨\n\n` +
@@ -357,9 +393,8 @@ export default {
                 }));
               }
               
-              await ctx.reply(`✅ <b>Broadcast complete.</b>\nAlert successfully delivered to <b>${successCount}</b> donors in <b>${escapeHtml(finalMeta.upazila)}</b>.`, { parse_mode: "HTML" });
+              await ctx.reply(`✅ <b>Broadcast complete.</b>\nAlert successfully delivered to <b>${successCount}</b> eligible donors in <b>${escapeHtml(finalMeta.upazila)}</b>.`, { parse_mode: "HTML" });
               
-              // Keep session open to track incoming donor responses
               await updateSession(chatId, "WAITING_DONOR", finalMeta);
           } else {
               await ctx.reply(`⚠️ No registered <b>${escapeHtml(finalMeta.bloodGroup)}</b> donors found in <b>${escapeHtml(finalMeta.upazila)}</b> yet.`, { parse_mode: "HTML" });
