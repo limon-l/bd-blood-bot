@@ -15,5 +15,9 @@
     "typescript": "^5.5.2",
     "vitest": "~3.2.0",
     "wrangler": "^4.110.0"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.110.2",
+    "grammy": "^1.44.0"
   }
 }
